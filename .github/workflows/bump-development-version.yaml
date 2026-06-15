@@ -117,12 +117,12 @@ jobs:
         run: |
           git checkout -b ${{ inputs.branch_name }}
 
-      - name: Run build-locally script at current version
-        env:
-          SOURCE_MAVEN: file:///home/runner/.m2/repository
-        run: |
-          chmod +x ./tools/build-locally.sh
-          ./tools/build-locally.sh
+      # - name: Run build-locally script at current version
+      #   env:
+      #     SOURCE_MAVEN: file:///home/runner/.m2/repository
+      #   run: |
+      #     chmod +x ./tools/build-locally.sh
+      #     ./tools/build-locally.sh
 
       - name: Run set-version script
         run: |
