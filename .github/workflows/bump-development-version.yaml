@@ -108,17 +108,6 @@ jobs:
         with:
           python-version: 3.x
 
-      - name: Delete existing branch if it exists
-        run: |
-          git config user.name "github-actions[bot]"
-          git config user.email "github-actions[bot]@users.noreply.github.com"
-          git push origin --delete ${{ inputs.branch_name }} || true
-          git branch -D ${{ inputs.branch_name }} || true
-
-      - name: Create version bump branch
-        run: |
-          git checkout -b ${{ inputs.branch_name }}
-
       - name: Run set-version script
         run: |
           chmod +x ./tools/set-version.sh
@@ -131,28 +120,92 @@ jobs:
           chmod +x ./tools/build-locally.sh
           ./tools/build-locally.sh
 
-      - name: Push changes and create PR
-        env:
-          GH_TOKEN: ${{ secrets.GALASA_TEAM_GITHUB_TOKEN }}
-        run: |
-          git add .
-          git commit -m "Bump version to ${{ inputs.new_version }}"
-          git push origin ${{ inputs.branch_name }}
-          
-          gh pr create \
-            --title "Bump version to ${{ inputs.new_version }}" \
-            --body "Automated version bump from ${{ inputs.released_version }} to ${{ inputs.new_version }}" \
-            --base main \
-            --head ${{ inputs.branch_name }}
-
-      - name: Output PR URL
+      - name: Commit changes and create PR via GitHub API
         id: pr_url
+        uses: actions/github-script@v7
         env:
-          GH_TOKEN: ${{ secrets.GALASA_TEAM_GITHUB_TOKEN }}
-        run: |
-          PR_URL=$(gh pr view ${{ inputs.branch_name }} --json url -q .url)
-          echo "pr_url=${PR_URL}" >> $GITHUB_OUTPUT
-          echo "Galasa PR created: ${PR_URL}"
+          NEW_VERSION: ${{ inputs.new_version }}
+          RELEASED_VERSION: ${{ inputs.released_version }}
+          BRANCH_NAME: ${{ inputs.branch_name }}
+        with:
+          github-token: ${{ secrets.GALASA_TEAM_GITHUB_TOKEN }}
+          script: |
+            const { NEW_VERSION, RELEASED_VERSION, BRANCH_NAME } = process.env;
+            const owner = context.repo.owner;
+            const repo = 'galasa';
+
+            // Get the SHA of main
+            const { data: ref } = await github.rest.git.getRef({ owner, repo, ref: 'heads/main' });
+            const baseSha = ref.object.sha;
+
+            // Delete branch if it exists, then recreate from main
+            try {
+              await github.rest.git.deleteRef({ owner, repo, ref: `heads/${BRANCH_NAME}` });
+            } catch (e) {
+              if (e.status !== 422) throw e;
+            }
+            await github.rest.git.createRef({ owner, repo, ref: `refs/heads/${BRANCH_NAME}`, sha: baseSha });
+
+            // Collect all changed files from the working tree
+            const { execSync } = require('child_process');
+            const changedFiles = execSync('git diff --name-only HEAD', { encoding: 'utf8' })
+              .trim().split('\n').filter(Boolean);
+
+            if (changedFiles.length === 0) {
+              core.setFailed('No files were changed by the set-version script');
+              return;
+            }
+
+            // Get the base commit's tree SHA
+            const { data: baseCommit } = await github.rest.git.getCommit({ owner, repo, commit_sha: baseSha });
+            const baseTreeSha = baseCommit.tree.sha;
+
+            // Create a blob for each changed file and build the tree entries
+            const fs = require('fs');
+            const treeItems = [];
+            for (const filePath of changedFiles) {
+              const content = fs.readFileSync(filePath, { encoding: 'utf8' });
+              const { data: blob } = await github.rest.git.createBlob({
+                owner, repo,
+                content: Buffer.from(content).toString('base64'),
+                encoding: 'base64'
+              });
+              treeItems.push({ path: filePath, mode: '100644', type: 'blob', sha: blob.sha });
+            }
+
+            // Create a new tree based on the existing tree plus the changed files
+            const { data: newTree } = await github.rest.git.createTree({
+              owner, repo,
+              base_tree: baseTreeSha,
+              tree: treeItems
+            });
+
+            // Create the commit (GitHub API commits are signed/verified)
+            const { data: newCommit } = await github.rest.git.createCommit({
+              owner, repo,
+              message: `Bump version to ${NEW_VERSION}`,
+              tree: newTree.sha,
+              parents: [baseSha]
+            });
+
+            // Update the branch to point at the new commit
+            await github.rest.git.updateRef({
+              owner, repo,
+              ref: `heads/${BRANCH_NAME}`,
+              sha: newCommit.sha
+            });
+
+            // Create the pull request
+            const { data: pr } = await github.rest.pulls.create({
+              owner, repo,
+              title: `Bump version to ${NEW_VERSION}`,
+              body: `Automated version bump from ${RELEASED_VERSION} to ${NEW_VERSION}`,
+              head: BRANCH_NAME,
+              base: 'main'
+            });
+
+            core.setOutput('pr_url', pr.html_url);
+            console.log(`Galasa PR created: ${pr.html_url}`);
 
       - name: Upload Maven Artifacts
         uses: actions/upload-artifact@v4
@@ -175,44 +228,84 @@ jobs:
           token: ${{ secrets.GALASA_TEAM_GITHUB_TOKEN }}
           ref: main
 
-      - name: Delete existing branch if it exists
-        run: |
-          git config user.name "github-actions[bot]"
-          git config user.email "github-actions[bot]@users.noreply.github.com"
-          git push origin --delete ${{ inputs.branch_name }} || true
-          git branch -D ${{ inputs.branch_name }} || true
-
-      - name: Create version bump branch
-        run: |
-          git checkout -b ${{ inputs.branch_name }}
-
       - name: Run set-version script
         run: |
           chmod +x set-version.sh
           ./set-version.sh --version ${{ inputs.new_version }}
 
-      - name: Push changes and create PR
-        env:
-          GH_TOKEN: ${{ secrets.GALASA_TEAM_GITHUB_TOKEN }}
-        run: |
-          git add .
-          git commit -m "Bump version to ${{ inputs.new_version }}"
-          git push origin ${{ inputs.branch_name }}
-          
-          gh pr create \
-            --title "Bump version to ${{ inputs.new_version }}" \
-            --body "Automated version bump from ${{ inputs.released_version }} to ${{ inputs.new_version }}" \
-            --base main \
-            --head ${{ inputs.branch_name }}
-
-      - name: Output PR URL
+      - name: Commit changes and create PR via GitHub API
         id: pr_url
+        uses: actions/github-script@v7
         env:
-          GH_TOKEN: ${{ secrets.GALASA_TEAM_GITHUB_TOKEN }}
-        run: |
-          PR_URL=$(gh pr view ${{ inputs.branch_name }} --json url -q .url)
-          echo "pr_url=${PR_URL}" >> $GITHUB_OUTPUT
-          echo "Helm PR created: ${PR_URL}"
+          NEW_VERSION: ${{ inputs.new_version }}
+          RELEASED_VERSION: ${{ inputs.released_version }}
+          BRANCH_NAME: ${{ inputs.branch_name }}
+        with:
+          github-token: ${{ secrets.GALASA_TEAM_GITHUB_TOKEN }}
+          script: |
+            const { NEW_VERSION, RELEASED_VERSION, BRANCH_NAME } = process.env;
+            const owner = context.repo.owner;
+            const repo = 'helm';
+
+            const { data: ref } = await github.rest.git.getRef({ owner, repo, ref: 'heads/main' });
+            const baseSha = ref.object.sha;
+
+            try {
+              await github.rest.git.deleteRef({ owner, repo, ref: `heads/${BRANCH_NAME}` });
+            } catch (e) {
+              if (e.status !== 422) throw e;
+            }
+            await github.rest.git.createRef({ owner, repo, ref: `refs/heads/${BRANCH_NAME}`, sha: baseSha });
+
+            const { execSync } = require('child_process');
+            const changedFiles = execSync('git diff --name-only HEAD', { encoding: 'utf8' })
+              .trim().split('\n').filter(Boolean);
+
+            if (changedFiles.length === 0) {
+              core.setFailed('No files were changed by the set-version script');
+              return;
+            }
+
+            const { data: baseCommit } = await github.rest.git.getCommit({ owner, repo, commit_sha: baseSha });
+            const baseTreeSha = baseCommit.tree.sha;
+
+            const fs = require('fs');
+            const treeItems = [];
+            for (const filePath of changedFiles) {
+              const content = fs.readFileSync(filePath, { encoding: 'utf8' });
+              const { data: blob } = await github.rest.git.createBlob({
+                owner, repo,
+                content: Buffer.from(content).toString('base64'),
+                encoding: 'base64'
+              });
+              treeItems.push({ path: filePath, mode: '100644', type: 'blob', sha: blob.sha });
+            }
+
+            const { data: newTree } = await github.rest.git.createTree({
+              owner, repo,
+              base_tree: baseTreeSha,
+              tree: treeItems
+            });
+
+            const { data: newCommit } = await github.rest.git.createCommit({
+              owner, repo,
+              message: `Bump version to ${NEW_VERSION}`,
+              tree: newTree.sha,
+              parents: [baseSha]
+            });
+
+            await github.rest.git.updateRef({ owner, repo, ref: `heads/${BRANCH_NAME}`, sha: newCommit.sha });
+
+            const { data: pr } = await github.rest.pulls.create({
+              owner, repo,
+              title: `Bump version to ${NEW_VERSION}`,
+              body: `Automated version bump from ${RELEASED_VERSION} to ${NEW_VERSION}`,
+              head: BRANCH_NAME,
+              base: 'main'
+            });
+
+            core.setOutput('pr_url', pr.html_url);
+            console.log(`Helm PR created: ${pr.html_url}`);
 
     outputs:
       pr_url: ${{ steps.pr_url.outputs.pr_url }}
@@ -235,17 +328,6 @@ jobs:
           java-version: '17'
           distribution: 'semeru'
 
-      - name: Delete existing branch if it exists
-        run: |
-          git config user.name "github-actions[bot]"
-          git config user.email "github-actions[bot]@users.noreply.github.com"
-          git push origin --delete ${{ inputs.branch_name }} || true
-          git branch -D ${{ inputs.branch_name }} || true
-
-      - name: Create version bump branch
-        run: |
-          git checkout -b ${{ inputs.branch_name }}
-
       # The simplatform set-version script runs a build that requires the built dev.galasa artifacts
       # to be present in the local Maven repository. These artifacts were built and uploaded by the
       # bump-galasa job, so we download them here before running set-version.
@@ -260,28 +342,79 @@ jobs:
           chmod +x set-version.sh
           ./set-version.sh --version ${{ inputs.new_version }}
 
-      - name: Push changes and create PR
-        env:
-          GH_TOKEN: ${{ secrets.GALASA_TEAM_GITHUB_TOKEN }}
-        run: |
-          git add .
-          git commit -m "Bump version to ${{ inputs.new_version }}"
-          git push origin ${{ inputs.branch_name }}
-          
-          gh pr create \
-            --title "Bump version to ${{ inputs.new_version }}" \
-            --body "Automated version bump from ${{ inputs.released_version }} to ${{ inputs.new_version }}" \
-            --base main \
-            --head ${{ inputs.branch_name }}
-
-      - name: Output PR URL
+      - name: Commit changes and create PR via GitHub API
         id: pr_url
+        uses: actions/github-script@v7
         env:
-          GH_TOKEN: ${{ secrets.GALASA_TEAM_GITHUB_TOKEN }}
-        run: |
-          PR_URL=$(gh pr view ${{ inputs.branch_name }} --json url -q .url)
-          echo "pr_url=${PR_URL}" >> $GITHUB_OUTPUT
-          echo "Simplatform PR created: ${PR_URL}"
+          NEW_VERSION: ${{ inputs.new_version }}
+          RELEASED_VERSION: ${{ inputs.released_version }}
+          BRANCH_NAME: ${{ inputs.branch_name }}
+        with:
+          github-token: ${{ secrets.GALASA_TEAM_GITHUB_TOKEN }}
+          script: |
+            const { NEW_VERSION, RELEASED_VERSION, BRANCH_NAME } = process.env;
+            const owner = context.repo.owner;
+            const repo = 'simplatform';
+
+            const { data: ref } = await github.rest.git.getRef({ owner, repo, ref: 'heads/main' });
+            const baseSha = ref.object.sha;
+
+            try {
+              await github.rest.git.deleteRef({ owner, repo, ref: `heads/${BRANCH_NAME}` });
+            } catch (e) {
+              if (e.status !== 422) throw e;
+            }
+            await github.rest.git.createRef({ owner, repo, ref: `refs/heads/${BRANCH_NAME}`, sha: baseSha });
+
+            const { execSync } = require('child_process');
+            const changedFiles = execSync('git diff --name-only HEAD', { encoding: 'utf8' })
+              .trim().split('\n').filter(Boolean);
+
+            if (changedFiles.length === 0) {
+              core.setFailed('No files were changed by the set-version script');
+              return;
+            }
+
+            const { data: baseCommit } = await github.rest.git.getCommit({ owner, repo, commit_sha: baseSha });
+            const baseTreeSha = baseCommit.tree.sha;
+
+            const fs = require('fs');
+            const treeItems = [];
+            for (const filePath of changedFiles) {
+              const content = fs.readFileSync(filePath, { encoding: 'utf8' });
+              const { data: blob } = await github.rest.git.createBlob({
+                owner, repo,
+                content: Buffer.from(content).toString('base64'),
+                encoding: 'base64'
+              });
+              treeItems.push({ path: filePath, mode: '100644', type: 'blob', sha: blob.sha });
+            }
+
+            const { data: newTree } = await github.rest.git.createTree({
+              owner, repo,
+              base_tree: baseTreeSha,
+              tree: treeItems
+            });
+
+            const { data: newCommit } = await github.rest.git.createCommit({
+              owner, repo,
+              message: `Bump version to ${NEW_VERSION}`,
+              tree: newTree.sha,
+              parents: [baseSha]
+            });
+
+            await github.rest.git.updateRef({ owner, repo, ref: `heads/${BRANCH_NAME}`, sha: newCommit.sha });
+
+            const { data: pr } = await github.rest.pulls.create({
+              owner, repo,
+              title: `Bump version to ${NEW_VERSION}`,
+              body: `Automated version bump from ${RELEASED_VERSION} to ${NEW_VERSION}`,
+              head: BRANCH_NAME,
+              base: 'main'
+            });
+
+            core.setOutput('pr_url', pr.html_url);
+            console.log(`Simplatform PR created: ${pr.html_url}`);
 
       - name: Upload Maven Artifacts
         uses: actions/upload-artifact@v4
@@ -304,44 +437,84 @@ jobs:
           token: ${{ secrets.GALASA_TEAM_GITHUB_TOKEN }}
           ref: main
 
-      - name: Delete existing branch if it exists
-        run: |
-          git config user.name "github-actions[bot]"
-          git config user.email "github-actions[bot]@users.noreply.github.com"
-          git push origin --delete ${{ inputs.branch_name }} || true
-          git branch -D ${{ inputs.branch_name }} || true
-
-      - name: Create version bump branch
-        run: |
-          git checkout -b ${{ inputs.branch_name }}
-
       - name: Run set-version script
         run: |
           chmod +x set-version.sh
           ./set-version.sh --version ${{ inputs.new_version }}
 
-      - name: Push changes and create PR
-        env:
-          GH_TOKEN: ${{ secrets.GALASA_TEAM_GITHUB_TOKEN }}
-        run: |
-          git add .
-          git commit -m "Bump version to ${{ inputs.new_version }}"
-          git push origin ${{ inputs.branch_name }}
-          
-          gh pr create \
-            --title "Bump version to ${{ inputs.new_version }}" \
-            --body "Automated version bump from ${{ inputs.released_version }} to ${{ inputs.new_version }}" \
-            --base main \
-            --head ${{ inputs.branch_name }}
-
-      - name: Output PR URL
+      - name: Commit changes and create PR via GitHub API
         id: pr_url
+        uses: actions/github-script@v7
         env:
-          GH_TOKEN: ${{ secrets.GALASA_TEAM_GITHUB_TOKEN }}
-        run: |
-          PR_URL=$(gh pr view ${{ inputs.branch_name }} --json url -q .url)
-          echo "pr_url=${PR_URL}" >> $GITHUB_OUTPUT
-          echo "Web UI PR created: ${PR_URL}"
+          NEW_VERSION: ${{ inputs.new_version }}
+          RELEASED_VERSION: ${{ inputs.released_version }}
+          BRANCH_NAME: ${{ inputs.branch_name }}
+        with:
+          github-token: ${{ secrets.GALASA_TEAM_GITHUB_TOKEN }}
+          script: |
+            const { NEW_VERSION, RELEASED_VERSION, BRANCH_NAME } = process.env;
+            const owner = context.repo.owner;
+            const repo = 'webui';
+
+            const { data: ref } = await github.rest.git.getRef({ owner, repo, ref: 'heads/main' });
+            const baseSha = ref.object.sha;
+
+            try {
+              await github.rest.git.deleteRef({ owner, repo, ref: `heads/${BRANCH_NAME}` });
+            } catch (e) {
+              if (e.status !== 422) throw e;
+            }
+            await github.rest.git.createRef({ owner, repo, ref: `refs/heads/${BRANCH_NAME}`, sha: baseSha });
+
+            const { execSync } = require('child_process');
+            const changedFiles = execSync('git diff --name-only HEAD', { encoding: 'utf8' })
+              .trim().split('\n').filter(Boolean);
+
+            if (changedFiles.length === 0) {
+              core.setFailed('No files were changed by the set-version script');
+              return;
+            }
+
+            const { data: baseCommit } = await github.rest.git.getCommit({ owner, repo, commit_sha: baseSha });
+            const baseTreeSha = baseCommit.tree.sha;
+
+            const fs = require('fs');
+            const treeItems = [];
+            for (const filePath of changedFiles) {
+              const content = fs.readFileSync(filePath, { encoding: 'utf8' });
+              const { data: blob } = await github.rest.git.createBlob({
+                owner, repo,
+                content: Buffer.from(content).toString('base64'),
+                encoding: 'base64'
+              });
+              treeItems.push({ path: filePath, mode: '100644', type: 'blob', sha: blob.sha });
+            }
+
+            const { data: newTree } = await github.rest.git.createTree({
+              owner, repo,
+              base_tree: baseTreeSha,
+              tree: treeItems
+            });
+
+            const { data: newCommit } = await github.rest.git.createCommit({
+              owner, repo,
+              message: `Bump version to ${NEW_VERSION}`,
+              tree: newTree.sha,
+              parents: [baseSha]
+            });
+
+            await github.rest.git.updateRef({ owner, repo, ref: `heads/${BRANCH_NAME}`, sha: newCommit.sha });
+
+            const { data: pr } = await github.rest.pulls.create({
+              owner, repo,
+              title: `Bump version to ${NEW_VERSION}`,
+              body: `Automated version bump from ${RELEASED_VERSION} to ${NEW_VERSION}`,
+              head: BRANCH_NAME,
+              base: 'main'
+            });
+
+            core.setOutput('pr_url', pr.html_url);
+            console.log(`Web UI PR created: ${pr.html_url}`);
 
     outputs:
       pr_url: ${{ steps.pr_url.outputs.pr_url }}
@@ -358,44 +531,84 @@ jobs:
           token: ${{ secrets.GALASA_TEAM_GITHUB_TOKEN }}
           ref: main
 
-      - name: Delete existing branch if it exists
-        run: |
-          git config user.name "github-actions[bot]"
-          git config user.email "github-actions[bot]@users.noreply.github.com"
-          git push origin --delete ${{ inputs.branch_name }} || true
-          git branch -D ${{ inputs.branch_name }} || true
-
-      - name: Create version bump branch
-        run: |
-          git checkout -b ${{ inputs.branch_name }}
-
       - name: Run set-version script
         run: |
           chmod +x set-version.sh
           ./set-version.sh --version ${{ inputs.new_version }}
 
-      - name: Push changes and create PR
-        env:
-          GH_TOKEN: ${{ secrets.GALASA_TEAM_GITHUB_TOKEN }}
-        run: |
-          git add .
-          git commit -m "Bump version to ${{ inputs.new_version }}"
-          git push origin ${{ inputs.branch_name }}
-          
-          gh pr create \
-            --title "Bump version to ${{ inputs.new_version }}" \
-            --body "Automated version bump from ${{ inputs.released_version }} to ${{ inputs.new_version }}" \
-            --base main \
-            --head ${{ inputs.branch_name }}
-
-      - name: Output PR URL
+      - name: Commit changes and create PR via GitHub API
         id: pr_url
+        uses: actions/github-script@v7
         env:
-          GH_TOKEN: ${{ secrets.GALASA_TEAM_GITHUB_TOKEN }}
-        run: |
-          PR_URL=$(gh pr view ${{ inputs.branch_name }} --json url -q .url)
-          echo "pr_url=${PR_URL}" >> $GITHUB_OUTPUT
-          echo "Integratedtests PR created: ${PR_URL}"
+          NEW_VERSION: ${{ inputs.new_version }}
+          RELEASED_VERSION: ${{ inputs.released_version }}
+          BRANCH_NAME: ${{ inputs.branch_name }}
+        with:
+          github-token: ${{ secrets.GALASA_TEAM_GITHUB_TOKEN }}
+          script: |
+            const { NEW_VERSION, RELEASED_VERSION, BRANCH_NAME } = process.env;
+            const owner = context.repo.owner;
+            const repo = 'integratedtests';
+
+            const { data: ref } = await github.rest.git.getRef({ owner, repo, ref: 'heads/main' });
+            const baseSha = ref.object.sha;
+
+            try {
+              await github.rest.git.deleteRef({ owner, repo, ref: `heads/${BRANCH_NAME}` });
+            } catch (e) {
+              if (e.status !== 422) throw e;
+            }
+            await github.rest.git.createRef({ owner, repo, ref: `refs/heads/${BRANCH_NAME}`, sha: baseSha });
+
+            const { execSync } = require('child_process');
+            const changedFiles = execSync('git diff --name-only HEAD', { encoding: 'utf8' })
+              .trim().split('\n').filter(Boolean);
+
+            if (changedFiles.length === 0) {
+              core.setFailed('No files were changed by the set-version script');
+              return;
+            }
+
+            const { data: baseCommit } = await github.rest.git.getCommit({ owner, repo, commit_sha: baseSha });
+            const baseTreeSha = baseCommit.tree.sha;
+
+            const fs = require('fs');
+            const treeItems = [];
+            for (const filePath of changedFiles) {
+              const content = fs.readFileSync(filePath, { encoding: 'utf8' });
+              const { data: blob } = await github.rest.git.createBlob({
+                owner, repo,
+                content: Buffer.from(content).toString('base64'),
+                encoding: 'base64'
+              });
+              treeItems.push({ path: filePath, mode: '100644', type: 'blob', sha: blob.sha });
+            }
+
+            const { data: newTree } = await github.rest.git.createTree({
+              owner, repo,
+              base_tree: baseTreeSha,
+              tree: treeItems
+            });
+
+            const { data: newCommit } = await github.rest.git.createCommit({
+              owner, repo,
+              message: `Bump version to ${NEW_VERSION}`,
+              tree: newTree.sha,
+              parents: [baseSha]
+            });
+
+            await github.rest.git.updateRef({ owner, repo, ref: `heads/${BRANCH_NAME}`, sha: newCommit.sha });
+
+            const { data: pr } = await github.rest.pulls.create({
+              owner, repo,
+              title: `Bump version to ${NEW_VERSION}`,
+              body: `Automated version bump from ${RELEASED_VERSION} to ${NEW_VERSION}`,
+              head: BRANCH_NAME,
+              base: 'main'
+            });
+
+            core.setOutput('pr_url', pr.html_url);
+            console.log(`Integratedtests PR created: ${pr.html_url}`);
 
     outputs:
       pr_url: ${{ steps.pr_url.outputs.pr_url }}
@@ -418,17 +631,6 @@ jobs:
           java-version: '17'
           distribution: 'semeru'
 
-      - name: Delete existing branch if it exists
-        run: |
-          git config user.name "github-actions[bot]"
-          git config user.email "github-actions[bot]@users.noreply.github.com"
-          git push origin --delete ${{ inputs.branch_name }} || true
-          git branch -D ${{ inputs.branch_name }} || true
-
-      - name: Create version bump branch
-        run: |
-          git checkout -b ${{ inputs.branch_name }}
-
       # The isolated set-version script runs a build that requires the built dev.galasa artifacts
       # to be present in the local Maven repository. These artifacts were built and uploaded by the
       # bump-galasa job, so we download them here before running set-version.
@@ -443,28 +645,79 @@ jobs:
           chmod +x set-version.sh
           ./set-version.sh --version ${{ inputs.new_version }}
 
-      - name: Push changes and create PR
-        env:
-          GH_TOKEN: ${{ secrets.GALASA_TEAM_GITHUB_TOKEN }}
-        run: |
-          git add .
-          git commit -m "Bump version to ${{ inputs.new_version }}"
-          git push origin ${{ inputs.branch_name }}
-          
-          gh pr create \
-            --title "Bump version to ${{ inputs.new_version }}" \
-            --body "Automated version bump from ${{ inputs.released_version }} to ${{ inputs.new_version }}" \
-            --base main \
-            --head ${{ inputs.branch_name }}
-
-      - name: Output PR URL
+      - name: Commit changes and create PR via GitHub API
         id: pr_url
+        uses: actions/github-script@v7
         env:
-          GH_TOKEN: ${{ secrets.GALASA_TEAM_GITHUB_TOKEN }}
-        run: |
-          PR_URL=$(gh pr view ${{ inputs.branch_name }} --json url -q .url)
-          echo "pr_url=${PR_URL}" >> $GITHUB_OUTPUT
-          echo "Isolated PR created: ${PR_URL}"
+          NEW_VERSION: ${{ inputs.new_version }}
+          RELEASED_VERSION: ${{ inputs.released_version }}
+          BRANCH_NAME: ${{ inputs.branch_name }}
+        with:
+          github-token: ${{ secrets.GALASA_TEAM_GITHUB_TOKEN }}
+          script: |
+            const { NEW_VERSION, RELEASED_VERSION, BRANCH_NAME } = process.env;
+            const owner = context.repo.owner;
+            const repo = 'isolated';
+
+            const { data: ref } = await github.rest.git.getRef({ owner, repo, ref: 'heads/main' });
+            const baseSha = ref.object.sha;
+
+            try {
+              await github.rest.git.deleteRef({ owner, repo, ref: `heads/${BRANCH_NAME}` });
+            } catch (e) {
+              if (e.status !== 422) throw e;
+            }
+            await github.rest.git.createRef({ owner, repo, ref: `refs/heads/${BRANCH_NAME}`, sha: baseSha });
+
+            const { execSync } = require('child_process');
+            const changedFiles = execSync('git diff --name-only HEAD', { encoding: 'utf8' })
+              .trim().split('\n').filter(Boolean);
+
+            if (changedFiles.length === 0) {
+              core.setFailed('No files were changed by the set-version script');
+              return;
+            }
+
+            const { data: baseCommit } = await github.rest.git.getCommit({ owner, repo, commit_sha: baseSha });
+            const baseTreeSha = baseCommit.tree.sha;
+
+            const fs = require('fs');
+            const treeItems = [];
+            for (const filePath of changedFiles) {
+              const content = fs.readFileSync(filePath, { encoding: 'utf8' });
+              const { data: blob } = await github.rest.git.createBlob({
+                owner, repo,
+                content: Buffer.from(content).toString('base64'),
+                encoding: 'base64'
+              });
+              treeItems.push({ path: filePath, mode: '100644', type: 'blob', sha: blob.sha });
+            }
+
+            const { data: newTree } = await github.rest.git.createTree({
+              owner, repo,
+              base_tree: baseTreeSha,
+              tree: treeItems
+            });
+
+            const { data: newCommit } = await github.rest.git.createCommit({
+              owner, repo,
+              message: `Bump version to ${NEW_VERSION}`,
+              tree: newTree.sha,
+              parents: [baseSha]
+            });
+
+            await github.rest.git.updateRef({ owner, repo, ref: `heads/${BRANCH_NAME}`, sha: newCommit.sha });
+
+            const { data: pr } = await github.rest.pulls.create({
+              owner, repo,
+              title: `Bump version to ${NEW_VERSION}`,
+              body: `Automated version bump from ${RELEASED_VERSION} to ${NEW_VERSION}`,
+              head: BRANCH_NAME,
+              base: 'main'
+            });
+
+            core.setOutput('pr_url', pr.html_url);
+            console.log(`Isolated PR created: ${pr.html_url}`);
 
     outputs:
       pr_url: ${{ steps.pr_url.outputs.pr_url }}
@@ -477,46 +730,81 @@ jobs:
       - name: Checkout automation repository
         uses: actions/checkout@v4
 
-      - name: Delete existing branch if it exists
-        run: |
-          git config user.name "github-actions[bot]"
-          git config user.email "github-actions[bot]@users.noreply.github.com"
-          git push origin --delete ${{ inputs.branch_name }} || true
-          git branch -D ${{ inputs.branch_name }} || true
-
-      - name: Create version bump branch
-        run: |
-          git checkout -b ${{ inputs.branch_name }}
-
       - name: Run set-version.sh script
         run: |
           cd releasePipeline
           chmod +x set-version.sh
           ./set-version.sh --version ${{ inputs.new_version }}
 
-      - name: Push changes and create PR
-        env:
-          GH_TOKEN: ${{ secrets.GALASA_TEAM_GITHUB_TOKEN }}
-        run: |
-          git add infrastructure/cicsk8s/galasa-dev/cps-properties.yaml
-          git add infrastructure/galasa-kube1/galasa-service1/galasa-service-main-resources.yaml
-          git commit -m "Bump CPS properties to version ${{ inputs.new_version }}"
-          git push origin ${{ inputs.branch_name }}
-          
-          gh pr create \
-            --title "Bump CPS properties to version ${{ inputs.new_version }}" \
-            --body "Automated CPS properties update from ${{ inputs.released_version }} to ${{ inputs.new_version }}" \
-            --base main \
-            --head ${{ inputs.branch_name }}
-
-      - name: Output PR URL
+      - name: Commit changes and create PR via GitHub API
         id: pr_url
+        uses: actions/github-script@v7
         env:
-          GH_TOKEN: ${{ secrets.GALASA_TEAM_GITHUB_TOKEN }}
-        run: |
-          PR_URL=$(gh pr view ${{ inputs.branch_name }} --json url -q .url)
-          echo "pr_url=${PR_URL}" >> $GITHUB_OUTPUT
-          echo "Automation CPS PR created: ${PR_URL}"
+          NEW_VERSION: ${{ inputs.new_version }}
+          RELEASED_VERSION: ${{ inputs.released_version }}
+          BRANCH_NAME: ${{ inputs.branch_name }}
+        with:
+          script: |
+            const { NEW_VERSION, RELEASED_VERSION, BRANCH_NAME } = process.env;
+            const owner = context.repo.owner;
+            const repo = context.repo.repo;
+
+            const { data: ref } = await github.rest.git.getRef({ owner, repo, ref: 'heads/main' });
+            const baseSha = ref.object.sha;
+
+            try {
+              await github.rest.git.deleteRef({ owner, repo, ref: `heads/${BRANCH_NAME}` });
+            } catch (e) {
+              if (e.status !== 422) throw e;
+            }
+            await github.rest.git.createRef({ owner, repo, ref: `refs/heads/${BRANCH_NAME}`, sha: baseSha });
+
+            // Only commit the two specific files that this job updates
+            const filePaths = [
+              'infrastructure/cicsk8s/galasa-dev/cps-properties.yaml',
+              'infrastructure/galasa-kube1/galasa-service1/galasa-service-main-resources.yaml'
+            ];
+
+            const { data: baseCommit } = await github.rest.git.getCommit({ owner, repo, commit_sha: baseSha });
+            const baseTreeSha = baseCommit.tree.sha;
+
+            const fs = require('fs');
+            const treeItems = [];
+            for (const filePath of filePaths) {
+              const content = fs.readFileSync(filePath, { encoding: 'utf8' });
+              const { data: blob } = await github.rest.git.createBlob({
+                owner, repo,
+                content: Buffer.from(content).toString('base64'),
+                encoding: 'base64'
+              });
+              treeItems.push({ path: filePath, mode: '100644', type: 'blob', sha: blob.sha });
+            }
+
+            const { data: newTree } = await github.rest.git.createTree({
+              owner, repo,
+              base_tree: baseTreeSha,
+              tree: treeItems
+            });
+
+            const { data: newCommit } = await github.rest.git.createCommit({
+              owner, repo,
+              message: `Bump CPS properties to version ${NEW_VERSION}`,
+              tree: newTree.sha,
+              parents: [baseSha]
+            });
+
+            await github.rest.git.updateRef({ owner, repo, ref: `heads/${BRANCH_NAME}`, sha: newCommit.sha });
+
+            const { data: pr } = await github.rest.pulls.create({
+              owner, repo,
+              title: `Bump CPS properties to version ${NEW_VERSION}`,
+              body: `Automated CPS properties update from ${RELEASED_VERSION} to ${NEW_VERSION}`,
+              head: BRANCH_NAME,
+              base: 'main'
+            });
+
+            core.setOutput('pr_url', pr.html_url);
+            console.log(`Automation CPS PR created: ${pr.html_url}`);
 
     outputs:
       pr_url: ${{ steps.pr_url.outputs.pr_url }}
@@ -540,19 +828,19 @@ jobs:
         run: |
           echo "Pulling release image..."
           docker pull ghcr.io/galasa-dev/galasactl-ibm-x86_64:release
-          
+
           echo "Tagging as stable..."
           docker image tag ghcr.io/galasa-dev/galasactl-ibm-x86_64:release ghcr.io/galasa-dev/galasactl-ibm-x86_64:stable
-          
+
           echo "Pushing stable image..."
           docker image push ghcr.io/galasa-dev/galasactl-ibm-x86_64:stable
-          
+
           echo "Successfully retagged galasactl-ibm-x86_64:release to stable"
 
   create-summary:
     name: Create workflow summary
     runs-on: ubuntu-latest
-    needs: 
+    needs:
       - bump-galasa
       - bump-helm
       - bump-simplatform
@@ -567,16 +855,16 @@ jobs:
         run: |
           cat >> $GITHUB_STEP_SUMMARY << 'EOF'
           ## Development Version Bump Complete
-          
+
           ### Version Information
           - **Released Version**: ${{ inputs.released_version }}
           - **New Development Version**: ${{ inputs.new_version }}
           - **Branch Name**: ${{ inputs.branch_name }}
-          
+
           ### Pull Requests Created
-          
+
           The following PRs have been created and need to be reviewed and merged:
-          
+
           1. **Galasa**: ${{ needs.bump-galasa.outputs.pr_url }}
           2. **Helm**: ${{ needs.bump-helm.outputs.pr_url }}
           3. **Simplatform**: ${{ needs.bump-simplatform.outputs.pr_url }}
@@ -584,43 +872,24 @@ jobs:
           4. **Web UI**: ${{ needs.bump-webui.outputs.pr_url }}
           5. **Integratedtests**: ${{ needs.bump-integratedtests.outputs.pr_url }}
           6. **Isolated**: ${{ needs.bump-isolated.outputs.pr_url }}
-          
+
           ### Automation Repository Updates
           7. **Automation CPS**: ${{ needs.update-automation-cps.outputs.pr_url }}
              - Updates CPS properties in `infrastructure/cicsk8s/galasa-dev/cps-properties.yaml`
              - Updates GalasaStream resources in `infrastructure/galasa-kube1/galasa-service1/galasa-service-main-resources.yaml`
-          
+
           ### Docker Images
           - ✅ Retagged `galasactl-ibm-x86_64:release` to `stable`
-          
+
           ### Manual Steps Required
-          
+
           ⚠️ The following steps still need to be completed manually:
-          
+
           1. **Review and merge all PRs** in the order listed above
              - Wait for each PR build to pass before merging
              - Wait for each Main build to complete after merging
              - When Isolated Main build is triggered after Galasa CLI module build, cancel it (you'll rebuild it later)
-          
-          2. **Update internal test CPS properties** using galasactl:
-             ```bash
-             galasactl properties set \
-               --namespace framework \
-               --name test.stream.internal-inttests.location \
-               --value https://development.galasa.dev/main/maven-repo/internal-inttests/dev/galasa/dev.galasa.internal-inttests.obr/${{ inputs.new_version }}/dev.galasa.internal-inttests.obr-${{ inputs.new_version }}-testcatalog.json \
-               --bootstrap <bootstrap-url>
-             
-             galasactl properties set \
-               --namespace framework \
-               --name test.stream.internal-inttests.obr \
-               --value mvn:dev.galasa/dev.galasa.internal-inttests.obr/${{ inputs.new_version }}/obr \
-               --bootstrap <bootstrap-url>
-             ```
-          
-          3. **Verify CPS properties** were applied correctly in the cluster
-          
-          4. **Monitor ArgoCD** to ensure the changes are synced properly
-          
+
           ### Notes
           - CPS properties are automatically applied by ArgoCD when changes are pushed to the automation repository
           - The `galasactl-ibm-x86_64:stable` image is now using version ${{ inputs.released_version }} for regression testing
