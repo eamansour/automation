@@ -121,6 +121,7 @@ jobs:
         env:
           GH_TOKEN: ${{ secrets.GALASA_TEAM_GITHUB_TOKEN }}
         run: |
+          export GPG_TTY=$(tty)
           git add .
           git commit -s -m "${{ inputs.commit_message }} ${{ inputs.new_version }}"
           git push origin ${{ inputs.branch_name }}

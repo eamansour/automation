@@ -154,6 +154,7 @@ jobs:
         env:
           GH_TOKEN: ${{ secrets.GALASA_TEAM_GITHUB_TOKEN }}
         run: |
+          export GPG_TTY=$(tty)
           git add .
           git commit -s -m "Bump version to ${{ inputs.new_version }}"
           git push origin ${{ inputs.branch_name }}
@@ -300,6 +301,7 @@ jobs:
         env:
           GH_TOKEN: ${{ secrets.GALASA_TEAM_GITHUB_TOKEN }}
         run: |
+          export GPG_TTY=$(tty)
           git add infrastructure/cicsk8s/galasa-dev/cps-properties.yaml
           git add infrastructure/galasa-kube1/galasa-service1/galasa-service-main-resources.yaml
           git commit -s -m "Bump CPS properties to version ${{ inputs.new_version }}"
